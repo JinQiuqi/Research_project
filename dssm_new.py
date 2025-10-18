@@ -41,21 +41,21 @@ def parse_item_seq(seq_str):
 
 # --- 2. 自定义数据集 (AdDataset) ---
 # 这个数据集能够处理用户行为序列 item_seq
-class AdDataset(Dataset):
-    def __init__(self, X, y, max_seq_len=20):
+class AdDataset(Dataset): #PyTorch 自定义数据集类：把原始的 pandas DataFrame（包含用户特征、广告特征、序列特征等）转换为模型训练可直接使用的 tensor 数据格式
+    def __init__(self, X, y, max_seq_len=20): #构造函数 __init__：初始化所有特征张量
         # 用户特征
-        self.user_cont_features = {
-            "user_avg_ctr": torch.tensor(standardize(X["user_avg_ctr"].values), dtype=torch.float32),
-            "user_total_interactions": torch.tensor(standardize(X["user_total_interactions"].values), dtype=torch.float32),
+        self.user_cont_features = { #用户的连续数值型特征
+            "user_avg_ctr": torch.tensor(standardize(X["user_avg_ctr"].values), dtype=torch.float32), #平均点击率
+            "user_total_interactions": torch.tensor(standardize(X["user_total_interactions"].values), dtype=torch.float32), #总交互次数
         }
-        self.user_cat_features = {
-            "age_price": torch.tensor(X["age_price"].values, dtype=torch.long),
-            'gender_cate': torch.tensor(X["gender_cate"].values, dtype=torch.long),
-            'cms_group_id': torch.tensor(X["cms_group_id"].values, dtype=torch.long),
+        self.user_cat_features = { #用户的离散类别特征
+            "age_price": torch.tensor(X["age_price"].values, dtype=torch.long), #年龄段 × 价格分段
+            'gender_cate': torch.tensor(X["gender_cate"].values, dtype=torch.long), #性别
+            'cms_group_id': torch.tensor(X["cms_group_id"].values, dtype=torch.long), #内容管理系统分组
         }
 
         # 广告特征
-        self.ad_cont_features = {
+        self.ad_cont_features = { #对广告的数值特征（CTR、价格、曝光数、点击数等）同样进行标准化
             "ad_ctr": torch.tensor(standardize(X["ad_ctr"].values), dtype=torch.float32),
             "price": torch.tensor(standardize(X["price"].values), dtype=torch.float32),
             "brand_total_impressions": torch.tensor(standardize(X["brand_total_impressions"].values), dtype=torch.float32),
@@ -66,16 +66,18 @@ class AdDataset(Dataset):
             'cate_ctr': torch.tensor(standardize(X['cate_ctr'].values), dtype=torch.float32),
             'cate_total_impressions': torch.tensor(standardize(X['cate_total_impressions'].values), dtype=torch.float32),
         }
-        self.ad_cat_features = {
+        self.ad_cat_features = { #广告（item）相关的离散特征，用于查 embedding
             "brand": torch.tensor(X["brand"].values, dtype=torch.long),
             "cate_id": torch.tensor(X["cate_id"].values, dtype=torch.long),
             "adgroup_id": torch.tensor(X["adgroup_id"].values, dtype=torch.long),
             "customer": torch.tensor(X["customer"].values, dtype=torch.long),
         }
 
-        self.labels = torch.tensor(y.values, dtype=torch.float32)
+        #标签部分
+        self.labels = torch.tensor(y.values, dtype=torch.float32) #标签 y 是点击率预测中的目标 (click / no-click)，一般是 0 或 1。方便喂入二分类的 BCE（交叉熵）损失函数
         
-        # --- 新增：处理用户行为序列 ---
+        # --- 新增：处理用户行为序列 --- 处理用户的历史行为序列（item_seq）
+        # 每个用户的点击历史长度不同，所以需要：1.截断太长的序列（取最近 max_seq_len 个）2.用 PAD_TOKEN（一般是0）填充太短的序列 3.拼成统一 shape 的张量 (num_samples, max_seq_len)
         self.max_seq_len = max_seq_len
         self.item_seq = []
         for seq in X['item_seq']:
@@ -86,9 +88,12 @@ class AdDataset(Dataset):
             self.item_seq.append(torch.tensor(seq, dtype=torch.long))
         self.item_seq = torch.stack(self.item_seq)
 
+    # 告诉 PyTorch 这个数据集一共有多少条样本。这让 DataLoader 知道迭代的范围。
     def __len__(self):
         return len(self.labels)
 
+    # 返回单条样本
+    # 这个函数定义“每次取第 idx 条样本时要返回什么”。它会从每个字典里提取同一行的值，最后打包成一个 tuple。
     def __getitem__(self, idx):
         item_seq = self.item_seq[idx]
         user_cont = [self.user_cont_features[col][idx] for col in self.user_cont_features]
