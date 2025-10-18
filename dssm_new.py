@@ -11,18 +11,25 @@ import os
 from datetime import datetime
 
 # --- 全局常量 ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu") #检查当前环境是否有可用的 NVIDIA GPU
 print(f"Using device: {DEVICE}")
-PAD_TOKEN = 0  # 用于序列填充的token
+PAD_TOKEN = 0  # 用于序列填充的token #定义“填充符”的取值，后续把可变长序列（如用户点击序列）补齐到同一长度时会用这个数。
+#能保证 RNN/Transformer/Embedding 在处理不同长度序列时对“补齐部分”不产生梯度贡献
 
-# --- 1. 数据处理与工具函数 ---
+# --- 1. 数据处理与工具函数 --- 同一张表中的不同列（特征），往往需要不同的数据处理方式
 
+#让数值特征“标准化”→ 模型更稳定
+#数据：用户/商品的数值属性（价格、年龄、时长等）等连续变量
 def standardize(feature_values):
     """对特征值进行标准化处理"""
     mean_val = feature_values.mean()
-    std_val = feature_values.std() if feature_values.std() > 0 else 1
+    #std_val = feature_values.std() if feature_values.std() > 0 else 1
+    std_val = feature_values.std()
+    std_val = std_val if std_val > 0 else 1.0
     return (feature_values - mean_val) / std_val
 
+#让序列特征“结构化”→ 能喂进 embedding 层
+#数据：用户或物料的行为序列（ID序列）等离散变量（用户的历史点击 / 浏览 / 购买记录等）
 def parse_item_seq(seq_str):
     """将 "[1, 2, 3]" 这样的字符串解析为整数列表"""
     if pd.isna(seq_str) or str(seq_str).strip() == "[]":
