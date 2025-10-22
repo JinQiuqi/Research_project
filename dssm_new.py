@@ -111,41 +111,68 @@ class InfoNCELoss(nn.Module):
     """InfoNCE损失函数"""
     def __init__(self, temperature=0.07):
         super().__init__()
+        # temperature（温度系数）控制softmax的“平滑程度”
+        # 值越小，softmax输出越尖锐；值越大，分布越平滑
         self.temperature = temperature
 
     def forward(self, sim_matrix, targets):
+        """
+        参数：
+            sim_matrix: 相似度矩阵，形状 [batch_size, batch_size]
+                        sim_matrix[i, j] 表示第 i 个用户与第 j 个物品的相似度
+            targets: 正样本索引向量，形状 [batch_size]
+                     一般为 [0, 1, 2, ..., batch_size-1]，
+                     表示第 i 个用户的正样本是第 i 个物品
+        返回：
+            标量 loss，表示当前 batch 的平均 InfoNCE 损失
+        """
+        # 1️⃣ 取出每个样本的“正样本相似度”
+        #    gather(1, targets.unsqueeze(1)) 等价于 sim_matrix[i, targets[i]]
         pos_scores = sim_matrix.gather(1, targets.unsqueeze(1)).squeeze(1)
+        # 2️⃣ 计算分母项：log(∑_j exp(sim_ij / T))
+        #    对每一行（即每个用户）计算所有物品的 softmax 归一化分母
+        #    这是对比学习中的“对比项”，包含正负样本
         log_sum_exp = torch.logsumexp(sim_matrix / self.temperature, dim=1)
+        # 3️⃣ 计算每个样本的 InfoNCE 损失
+        #    InfoNCE公式：
+        #    L_i = -log( exp(sim_{i, y_i}/T) / ∑_j exp(sim_{i,j}/T) )
+        #    展开后为：L_i = -(sim_{i,y_i}/T - log∑_j exp(sim_{i,j}/T))
         per_sample_loss = -(pos_scores / self.temperature - log_sum_exp)
+        # 4️⃣ 对所有样本的损失取平均
         return per_sample_loss.mean()
 
 # --- 新增：自定义带数值裁剪的TransformerEncoderLayer ---
 # --- 新增：自定义带数值裁剪的TransformerEncoderLayer（修复后）---
 # --- 重新定义CustomTransformerEncoderLayer（手动实现自注意力）---
 class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    #这部分的目的是控制注意力计算中的数值幅度，避免中间张量过大导致 softmax 溢出或梯度不稳定。
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, 
                  activation=F.relu, layer_norm_eps=1e-5, batch_first=False, 
                  norm_first=False, bias=True, device=None, dtype=None):
+        # 继承父类的标准TransformerEncoderLayer初始化
         super().__init__(d_model, nhead, dim_feedforward, dropout, activation, 
                          layer_norm_eps, batch_first, norm_first, bias, device, dtype)
-        # 关键调整：更小的数值限制（进一步收紧）
-        self.qk_scale = 0.05  # 从0.1→0.05，进一步降低QK^T数值
-        self.attn_weight_clip = 3.0  # QK^T裁剪范围（保持3）
-        self.ffn_output_clip = 2.0   # FFN输出裁剪范围（从3→2，更严格）
-        self.qkv_clip = 1.0          # Q/K/V的数值裁剪范围（新增）
+        # 关键调整：更小的数值限制（进一步收紧） 数值稳定性调整参数
+        self.qk_scale = 0.05  # 从0.1→0.05，进一步降低QK^T数值 缩放QK^T时的比例系数（从0.1进一步缩小到0.05）
+        self.attn_weight_clip = 3.0  # QK^T裁剪范围（保持3） 限制注意力得分（QK^T）范围 [-3, 3]
+        self.ffn_output_clip = 2.0   # FFN输出裁剪范围（从3→2，更严格） 限制FFN输出范围 [-2, 2]
+        self.qkv_clip = 1.0          # Q/K/V的数值裁剪范围（新增） 限制Q、K、V张量范围 [-1, 1]
 
+    #定义自注意力模块
     def _sa_block(self, x, attn_mask, key_padding_mask, is_causal):
+        # x: [batch_size, seq_len, d_model]
         batch_size, seq_len, d_model = x.shape
         num_heads = self.self_attn.num_heads
-        d_k = d_model // num_heads
+        d_k = d_model // num_heads # 每个注意力头的维度
 
-        # 1. 分割Q、K、V权重并扩展批量维度
+        # 1. 分割Q、K、V权重并扩展批量维度 从自注意力层的参数中分割 Q、K、V 权重
+        # 原始 Transformer 使用线性层自动计算 Q、K、V。这里手动提取并扩展它们，使得每个 batch 样本共享权重。
         q_weight = self.self_attn.in_proj_weight[:d_model, :].unsqueeze(0).expand(batch_size, -1, -1)
         k_weight = self.self_attn.in_proj_weight[d_model:2*d_model, :].unsqueeze(0).expand(batch_size, -1, -1)
         v_weight = self.self_attn.in_proj_weight[2*d_model:, :].unsqueeze(0).expand(batch_size, -1, -1)
 
         # 2. 计算Q、K、V（新增：计算后立即裁剪，避免数值膨胀）
-        x_transposed = x.transpose(1, 2)
+        x_transposed = x.transpose(1, 2) # 转置方便矩阵乘法
         q = torch.bmm(q_weight, x_transposed).transpose(1, 2)
         k = torch.bmm(k_weight, x_transposed).transpose(1, 2)
         v = torch.bmm(v_weight, x_transposed).transpose(1, 2)
@@ -164,29 +191,35 @@ class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
             raise ValueError(f"❌ V存在NaN/Inf！max: {v.max()}, min: {v.min()}")
 
         # 3. 分头操作（不变）
+        # 将 d_model 拆分为多个注意力头（multi-head attention）
         q = q.view(batch_size, seq_len, num_heads, d_k).transpose(1, 2)
         k = k.view(batch_size, seq_len, num_heads, d_k).transpose(1, 2)
         v = v.view(batch_size, seq_len, num_heads, d_k).transpose(1, 2)
 
         # 4. QK^T计算（双重缩放+裁剪，不变）
+        # 计算注意力得分 QK^T + 缩放 + 裁剪
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (torch.sqrt(torch.tensor(d_k, dtype=torch.float32)) * self.qk_scale)
         attn_scores = torch.clamp(attn_scores, min=-self.attn_weight_clip, max=self.attn_weight_clip)
 
         # 5. 应用padding mask（不变）
+        # 对 padding 位置的 token（例如补齐的 0）进行屏蔽；用一个非常小的值（-1e9）保证它们 softmax 后几乎为 0。
         if key_padding_mask is not None:
             key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(1).bool()
             attn_scores = attn_scores.masked_fill(key_padding_mask, -1e9)
 
-        # 6. Softmax + Dropout（不变）
+        # 6. Softmax + Dropout（不变） 计算注意力权重
+        # 得到注意力权重矩阵（每行和为1），Dropout 用于防止过拟合。
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = F.dropout(attn_weights, p=self.self_attn.dropout, training=self.training)
 
         # 7. 注意力加权V + 输出投影（新增：投影后裁剪）
+        # 把注意力权重加权到 v 上；再通过线性层 out_proj 输出新的编码表示。
         x2 = torch.matmul(attn_weights, v)
         x2 = x2.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
         x2 = self.self_attn.out_proj(x2)
         
         # 新增：裁剪输出投影后的数值
+        # 防止经过多层矩阵乘法后的输出溢出。
         x2 = torch.clamp(x2, min=-self.attn_weight_clip, max=self.attn_weight_clip)
         if torch.isnan(x2).any() or torch.isinf(x2).any():
             raise ValueError(f"❌ 自注意力输出存在NaN/Inf！max: {x2.max()}, min: {x2.min()}")
@@ -197,10 +230,13 @@ class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
             x += torch.randn_like(x) * 1e-10  # 微小噪声打破全零
         x = self.norm1(x)
         return x
+
+    # 定义前馈网络 _ff_block()
+    # Transformer 的 FFN（Feed Forward Network）结构
     def _ff_block(self, x):
         # 第一步：linear1 + 裁剪 + ReLU
         x1 = self.linear1(x)
-        # 新增：裁剪linear1输出，防止ReLU后数值放大
+        # 新增：裁剪linear1输出，防止ReLU后数值放大 裁剪输出，防止linear1结果过大导致激活爆炸
         x1 = torch.clamp(x1, min=-self.ffn_output_clip, max=self.ffn_output_clip)
         if torch.isnan(x1).any() or torch.isinf(x1).any():
             raise ValueError(f"❌ FFN linear1输出存在NaN/Inf！max: {x1.max()}, min: {x1.min()}")
