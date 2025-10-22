@@ -259,25 +259,26 @@ class CustomTransformerEncoderLayer(nn.TransformerEncoderLayer):
         return x
 
 
+# 定义双塔模型：用户塔 + 物品塔
 class DualTower(nn.Module):
     def __init__(
         self,
         # --- 新增：用户行为序列参数 ---
-        num_item_ids,
-        max_seq_len,
-        user_seq_embedding_dim,
-        nhead,
-        num_layers,
+        num_item_ids, # item_id 总数（序列里每个ID的取值范围）
+        max_seq_len, # 用户行为序列的最大长度（本类中仅用于接口/约束）
+        user_seq_embedding_dim, # 序列中每个item的嵌入维度 d_model
+        nhead, # 序列中每个item的嵌入维度 d_model
+        num_layers, # Transformer 层数（此版本下面固定用1）
         
         # --- 新增：物品塔门控网络参数 ---
-        item_gru_hidden_dim,
+        item_gru_hidden_dim, # 物品塔GRU隐藏层维度
         
-        # 用户特征参数
+        # 用户特征参数（类别特征的取值总数）
         num_age_price,
         num_gender_cate,
         num_cms_group_id,
         
-        # 广告特征参数
+        # 广告特征参数（类别特征的取值总数）
         num_brand,
         num_cate_id,
         num_adgroup_id,
@@ -288,7 +289,7 @@ class DualTower(nn.Module):
         hidden_dim=32,
         final_dim=16
     ):
-        super().__init__()
+        super().__init__() # 调父类构造
 
         # --- 1. 用户塔 (User Tower) - 包含 Transformer ---
         self.item_seq_embedding = nn.Embedding(num_item_ids, user_seq_embedding_dim, padding_idx=PAD_TOKEN)
@@ -298,15 +299,16 @@ class DualTower(nn.Module):
 
         # 关键修改：替换为自定义的CustomTransformerEncoderLayer
         transformer_layer = CustomTransformerEncoderLayer(
-            d_model=user_seq_embedding_dim,
-            nhead=nhead,
-            dim_feedforward=hidden_dim,  # 保持32不变
-            dropout=0.3,  # 正则化
-            layer_norm_eps=1e-6,  # 提升数值稳定性
-            batch_first=True,
+            d_model=user_seq_embedding_dim, # 注意力层输入/输出维度
+            nhead=nhead, # 多头数
+            dim_feedforward=hidden_dim,  # 保持32不变 # FFN内部维度
+            dropout=0.3,  # 正则化 # dropout比例（正则）
+            layer_norm_eps=1e-6,  # 提升数值稳定性 # LayerNorm的eps，避免除零
+            batch_first=True, # 输入张量 (batch, seq, dim)
             # 自定义层的裁剪参数（已在CustomTransformerEncoderLayer中定义，这里可不用重复传）
         )
-        self.transformer_encoder = nn.TransformerEncoder(transformer_layer, num_layers=1)  # 层数1不变
+        self.transformer_encoder = nn.TransformerEncoder(# 堆叠若干层Encoder
+             transformer_layer, num_layers=1)  # 层数1不变
 
         # --- 新增：用户塔所有层的稳定初始化（关键！）---
         # 1. 序列嵌入层：Xavier初始化（适合线性变换）
@@ -339,6 +341,7 @@ class DualTower(nn.Module):
         # self.transformer_encoder = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
         
 
+        # --- 用户侧连续特征 → 线性映射到 embedding_dim ---
         self.user_avg_ctr_emb = nn.Linear(1, embedding_dim)
         self.user_total_interactions_emb = nn.Linear(1, embedding_dim)
         # 线性层初始化
@@ -347,7 +350,9 @@ class DualTower(nn.Module):
             # 替换Xavier为小标准差初始化
             nn.init.normal_(linear_layer.weight, mean=0.0, std=0.0001)
             nn.init.zeros_(linear_layer.bias)
+
         # 分类特征嵌入层初始化
+        # --- 用户侧类别特征 → Embedding ---
         self.age_price_emb = nn.Embedding(num_age_price, embedding_dim)
         self.gender_cate_emb = nn.Embedding(num_gender_cate, embedding_dim)
         self.cms_group_id_emb = nn.Embedding(num_cms_group_id, embedding_dim)
@@ -357,29 +362,32 @@ class DualTower(nn.Module):
 
         
         # Transformer输出维度 + 其他用户特征总维度
-        user_mlp_input_dim = user_seq_embedding_dim + embedding_dim * 5
+        # --- 用户塔 MLP：拼接(序列表示 + 5个用户特征嵌入)后降维至 final_dim ---
+        user_mlp_input_dim = user_seq_embedding_dim + embedding_dim * 5 # 序列输出 + 5路用户特征
         self.user_mlp = nn.Sequential(
-            nn.Linear(user_mlp_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, final_dim)
+            nn.Linear(user_mlp_input_dim, hidden_dim), # 拼接后先降到 hidden_dim
+            nn.ReLU(), # 非线性
+            nn.Linear(hidden_dim, final_dim) # 再降到最终维度
         )
 
-        # --- 2. 物品塔 (Item Tower) - 包含 GRU ---
-        self.ad_ctr_emb = nn.Linear(1, embedding_dim)
-        self.price_emb = nn.Linear(1, embedding_dim)
-        self.brand_total_impressions_emb = nn.Linear(1, embedding_dim)
-        self.brand_ctr_emb = nn.Linear(1, embedding_dim)
-        self.ad_total_clicks_emb = nn.Linear(1, embedding_dim)
-        self.ad_total_impressions_emb = nn.Linear(1, embedding_dim)
-        self.cate_total_clicks_emb = nn.Linear(1, embedding_dim)
-        self.cate_ctr_emb = nn.Linear(1, embedding_dim)
-        self.cate_total_impressions_emb = nn.Linear(1, embedding_dim)
+        # --- 2. 物品塔 (Item Tower) - 包含 GRU作为门控融合 ---
+        # 连续特征 → 线性到 embedding_dim
+        self.ad_ctr_emb = nn.Linear(1, embedding_dim) # 广告CTR
+        self.price_emb = nn.Linear(1, embedding_dim) # 价格
+        self.brand_total_impressions_emb = nn.Linear(1, embedding_dim) # 品牌曝光量
+        self.brand_ctr_emb = nn.Linear(1, embedding_dim) # 品牌CTR
+        self.ad_total_clicks_emb = nn.Linear(1, embedding_dim) # 广告总点击
+        self.ad_total_impressions_emb = nn.Linear(1, embedding_dim) # 广告总曝光
+        self.cate_total_clicks_emb = nn.Linear(1, embedding_dim) # 类目总点击
+        self.cate_ctr_emb = nn.Linear(1, embedding_dim) # 类目CTR
+        self.cate_total_impressions_emb = nn.Linear(1, embedding_dim)# 类目总曝光
+        # 类别特征 → Embedding
         self.adgroup_id_emb = nn.Embedding(num_adgroup_id, embedding_dim)
         self.cate_id_emb = nn.Embedding(num_cate_id, embedding_dim)
         self.brand_emb = nn.Embedding(num_brand, embedding_dim)
         self.customer_emb = nn.Embedding(num_customer, embedding_dim)
         
-        # 物品塔线性层（同理修改）
+        # 物品塔线性层（同理修改）。物品塔的线性层统一小std+bias零
         item_linear_layers = [
             self.ad_ctr_emb, self.price_emb, self.brand_total_impressions_emb,
             self.brand_ctr_emb, self.ad_total_clicks_emb, self.ad_total_impressions_emb,
@@ -390,20 +398,22 @@ class DualTower(nn.Module):
             nn.init.zeros_(linear_layer.bias)
        
 
-        # --- 然后继续定义物品塔的其他部分 ---
+        # --- 然后继续定义物品塔的其他部分 --- # （下方重复定义的embedding与上面一致，这里等同于再次赋值；保留不影响功能但可精简）
         self.adgroup_id_emb = nn.Embedding(num_adgroup_id, embedding_dim)
         self.cate_id_emb = nn.Embedding(num_cate_id, embedding_dim)
         self.brand_emb = nn.Embedding(num_brand, embedding_dim)
         self.customer_emb = nn.Embedding(num_customer, embedding_dim)
 
-        # GRU的输入维度是所有物品特征拼接后的维度
+        # GRU的输入维度是所有物品特征拼接后的维度 = 9个连续特征映射 + 4个类别embedding = 共13路 * embedding_dim
         item_gru_input_dim = embedding_dim * 13
 
-        self.item_gru = nn.GRU(
-            input_size=item_gru_input_dim, hidden_size=item_gru_hidden_dim, num_layers=1, batch_first=True
+        self.item_gru = nn.GRU( # 用GRU做“门控融合器”
+            input_size=item_gru_input_dim, # 每个时间步的输入向量维度
+            hidden_size=item_gru_hidden_dim, # GRU隐藏状态维度
+            num_layers=1, batch_first=True # (batch, seq, dim) 约定
         )
         
-        # 物品塔 MLP (输入维度调整为GRU的输出维度)
+        # 物品塔 MLP (输入维度调整为GRU的输出维度) ：将GRU输出（隐藏状态）映射到 final_dim
         self.item_mlp = nn.Sequential(
             nn.Linear(item_gru_hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -413,36 +423,36 @@ class DualTower(nn.Module):
     def forward_user(self, item_seq, user_avg_ctr, user_total_interactions, age_price, gender_cate, cms_group_id):
         """计算用户向量（带数值限制和逐步骤检查）"""
         # a. 物品序列嵌入（新增：裁剪嵌入值）
-        seq_emb = self.item_seq_embedding(item_seq)
-        seq_emb = seq_emb * 0.5  # 缩小初始嵌入值
-        seq_emb = torch.clamp(seq_emb, min=-1.0, max=1.0)  # 从[-2,2]→[-1,1]，更严格
+        seq_emb = self.item_seq_embedding(item_seq) # (B, L) → (B, L, d_model)
+        seq_emb = seq_emb * 0.5  # 缩小初始嵌入值，防止初期注意力爆炸
+        seq_emb = torch.clamp(seq_emb, min=-1.0, max=1.0)  # 从[-2,2]→[-1,1]，更严格，进一步限制范围
         if torch.isnan(seq_emb).any() or torch.isinf(seq_emb).any():
             raise ValueError(f"❌ seq_emb存在NaN/Inf！max: {seq_emb.max()}, min: {seq_emb.min()}")
 
         # b. Transformer编码（恢复全padding检查）
-        src_key_padding_mask = (item_seq == PAD_TOKEN).bool()
-        if src_key_padding_mask.all():
+        src_key_padding_mask = (item_seq == PAD_TOKEN).bool() # True表示是padding位置
+        if src_key_padding_mask.all(): # 全padding没有有效序列
             raise ValueError(f"❌ 序列全是padding！item_seq: {item_seq}")
-        seq_output = self.transformer_encoder(seq_emb, src_key_padding_mask=src_key_padding_mask)
-        seq_output = torch.clamp(seq_output, min=-5.0, max=5.0)  # 保持不变
+        seq_output = self.transformer_encoder(seq_emb, src_key_padding_mask=src_key_padding_mask) # 编码序列# (B, L, d_model)
+        seq_output = torch.clamp(seq_output, min=-5.0, max=5.0)  # 保持不变# 编码后再限幅
         if torch.isnan(seq_output).any() or torch.isinf(seq_output).any():
             raise ValueError(f"❌ Transformer输出存在NaN/Inf！max: {seq_output.max()}, min: {seq_output.min()}")
 
-        # c. 平均池化（不变）
-        non_pad_mask = (item_seq != PAD_TOKEN).unsqueeze(2).float()
-        seq_rep = (seq_output * non_pad_mask).sum(dim=1) / (non_pad_mask.sum(dim=1) + 1e-8)
-        seq_rep = torch.clamp(seq_rep, min=-5.0, max=5.0)
+        # c. 平均池化（不变）。对非padding位置做平均池化（得到一个序列表示）
+        non_pad_mask = (item_seq != PAD_TOKEN).unsqueeze(2).float() # (B, L, 1) 1为有效，0为pad
+        seq_rep = (seq_output * non_pad_mask).sum(dim=1) / (non_pad_mask.sum(dim=1) + 1e-8)  # 加权平均
+        seq_rep = torch.clamp(seq_rep, min=-5.0, max=5.0) # 再次限幅
         if torch.isnan(seq_rep).any() or torch.isinf(seq_rep).any():
             raise ValueError(f"❌ seq_rep存在NaN/Inf！max: {seq_rep.max()}, min: {seq_rep.min()}")
 
-        # d. 其他用户特征嵌入（新增：裁剪嵌入值）
+        # d. 其他用户特征嵌入（新增：裁剪嵌入值）：类别→embedding；连续→线性层
         age_price_embbed = self.age_price_emb(age_price)
         gender_cate_embbed = self.gender_cate_emb(gender_cate)
         cms_group_id_embbed = self.cms_group_id_emb(cms_group_id)
         user_avg_ctr_embbed = self.user_avg_ctr_emb(user_avg_ctr.unsqueeze(1))
         user_total_interactions_embbed = self.user_total_interactions_emb(user_total_interactions.unsqueeze(1))
         
-        # 新增：裁剪所有用户特征嵌入值
+        # 新增：裁剪所有用户特征嵌入值，避免异常
         all_embeddings = [age_price_embbed, gender_cate_embbed, cms_group_id_embbed, user_avg_ctr_embbed, user_total_interactions_embbed]
         for i, emb in enumerate(all_embeddings):
             emb = torch.clamp(emb, min=-2.0, max=2.0)
@@ -451,7 +461,7 @@ class DualTower(nn.Module):
                 raise ValueError(f"❌ 用户特征嵌入{i}存在NaN/Inf！max: {emb.max()}, min: {emb.min()}")
         age_price_embbed, gender_cate_embbed, cms_group_id_embbed, user_avg_ctr_embbed, user_total_interactions_embbed = all_embeddings
 
-        # e. 拼接特征并通过MLP（不变）
+        # e. 拼接特征并通过MLP（不变）：序列表示 + 5个用户特征
         user_features = torch.cat(
             [seq_rep, user_avg_ctr_embbed, user_total_interactions_embbed, age_price_embbed, gender_cate_embbed, cms_group_id_embbed],
             dim=1
@@ -463,14 +473,17 @@ class DualTower(nn.Module):
 
         # f. L2归一化（不变）
         return F.normalize(user_vector, p=2, dim=1)
+
+
     def forward_item(self, ad_ctr, price, brand_total_impressions, brand_ctr, ad_total_clicks, ad_total_impressions,
                      cate_total_clicks, cate_ctr, cate_total_impressions, brand, cate_id, adgroup_id, customer):
         """计算物品向量（使用门控网络融合特征）"""
-        # a. 处理所有物品特征
+        # a. 处理所有物品特征 # a) 类别特征 → Embedding；连续特征 → 线性到D，再统一拼接
         brand_embbed = self.brand_emb(brand)
         cate_id_embbed = self.cate_id_emb(cate_id)
         adgroup_id_embbed = self.adgroup_id_emb(adgroup_id)
         customer_embbed = self.customer_emb(customer)
+
         ad_ctr_embbed = self.ad_ctr_emb(ad_ctr.unsqueeze(1))
         price_embbed = self.price_emb(price.unsqueeze(1))
         brand_total_impressions_embbed = self.brand_total_impressions_emb(brand_total_impressions.unsqueeze(1))
@@ -481,7 +494,7 @@ class DualTower(nn.Module):
         cate_ctr_embbed = self.cate_ctr_emb(cate_ctr.unsqueeze(1))
         cate_total_impressions_embbed = self.cate_total_impressions_emb(cate_total_impressions.unsqueeze(1))
 
-        # b. 拼接所有物品特征向量
+        # b. 拼接所有物品特征向量 拼接全部13路特征 → (B, 13D)
         item_features = torch.cat(
             [ad_ctr_embbed, price_embbed, brand_total_impressions_embbed, brand_ctr_embbed,
              ad_total_clicks_embbed, ad_total_impressions_embbed, cate_total_clicks_embbed,
@@ -489,51 +502,62 @@ class DualTower(nn.Module):
              adgroup_id_embbed, customer_embbed], dim=1
         )
         
-        # c. 通过门控网络 (GRU)
+        # c. 通过门控网络 (GRU)：用GRU进行“门控融合”：此处把13D当作单步序列喂给GRU
         item_features_gru = item_features.unsqueeze(1) # GRU需要一个时间步维度
         _, h_n = self.item_gru(item_features_gru)
         item_gru_output = h_n.squeeze(0)
 
-        # d. 通过MLP生成最终物品向量
+        # d. 通过MLP生成最终物品向量。MLP映射到 final_dim，并做L2归一化
         return F.normalize(self.item_mlp(item_gru_output), p=2, dim=1)
 
     def forward(self, user_features_batch, item_features_batch):
-        """计算相似度矩阵"""
-        user_vectors = self.forward_user(*user_features_batch)
-        item_vectors = self.forward_item(*item_features_batch)
-        return torch.matmul(user_vectors, item_vectors.T)
+        """计算相似度矩阵（用于InfoNCE或召回打分）"""
+        user_vectors = self.forward_user(*user_features_batch) # (B, D) 用户向量
+        item_vectors = self.forward_item(*item_features_batch) # (B, D) 物品向量
+        return torch.matmul(user_vectors, item_vectors.T) # (B, B) 相似度矩阵：i行对j列的相似度
 
 
 # --- 4. 完整的训练与评估函数 ---
+# 定义一个函数来训练并评估 InfoNCE 双塔模型
 def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs=10, lr=0.001, temperature=0.07):
+    # 把模型放到 GPU 或 CPU 上
     model.to(DEVICE)
+    # 使用 InfoNCE 损失函数
     criterion = InfoNCELoss(temperature=temperature)
+    # 采用 AdamW 优化器，比 Adam 多了权重衰减（weight decay）稳定性更好。
     # optimizer = optim.Adam(model.parameters(), lr=lr)
     optimizer = optim.AdamW(model.parameters(), lr=lr) 
+    # 学习率调度器：如果连续若干个 epoch（2个）验证集 AUC 没有提升 → 学习率减半。
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2, verbose=True)
 
-    # 2. 设置梯度裁剪的范数阈值
+    # 2. 设置梯度裁剪的范数阈值。梯度裁剪阈值，防止梯度爆炸。训练时若梯度范数超过 0.05，会被强制缩放。
     grad_clip_value = 0.05 
 
+    # 提取测试集的用户 ID（后面在评估阶段要按用户分组计算 Recall@K）。
     test_user_ids = test_df['user'].values
 
+    # 多轮训练，每个 epoch 包含一个“训练阶段”和一个“评估阶段”。
     for epoch in range(epochs):
         # --- 训练阶段 ---
         model.train()
         train_loss = 0.0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]"):
-            # --- 修改：解包数据 ---
-            item_seq = batch[0]
-            user_cont_features = batch[1:3]
-            user_cat_features = batch[3:6]
-            ad_cont_features = batch[6:15]
-            ad_cat_features = batch[15:-1]
-            labels = batch[-1]
+            # --- 修改：解包batch数据 ---
+            item_seq = batch[0] # 用户的行为序列
+            user_cont_features = batch[1:3] # 用户连续特征（如点击率、交互数）
+            user_cat_features = batch[3:6] # 用户离散特征（如性别、年龄组）
+            ad_cont_features = batch[6:15] # 广告连续特征（价格、曝光、CTR等）
+            ad_cat_features = batch[15:-1] # 广告类别特征（品牌、类目ID、客户ID等）
+            labels = batch[-1] # 目标标签（是否点击）
 
+            # 组装为模型输入格式
             user_features_batch = [item_seq.to(DEVICE), *[x.to(DEVICE) for x in user_cont_features], *[x.to(DEVICE) for x in user_cat_features]]
             item_features_batch = [*[x.to(DEVICE) for x in ad_cont_features], *[x.to(DEVICE) for x in ad_cat_features]]
             
+            # 前向传播（计算相似度矩阵）
             sim_matrix = model(user_features_batch, item_features_batch)
+
+            # 生成 InfoNCE 损失目标
             batch_size = sim_matrix.size(0)
             targets = torch.arange(batch_size, device=DEVICE)
             loss = criterion(sim_matrix, targets)
@@ -543,6 +567,7 @@ def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs
                 print(f"!!! Loss is NaN at Epoch {epoch+1}, Batch {batch_idx+1} !!!")
                 # 在这里可以设置断点进行调试
 
+            # 反向传播
             optimizer.zero_grad()
             loss.backward()
 
@@ -555,7 +580,8 @@ def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs
             # --- 3. 添加梯度裁剪 ---
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_value)
 
-            optimizer.step()
+            optimizer.step() # 参数更新
+
             # --- 新增：检查参数是否为 NaN ---
             for name, param in model.named_parameters():
                 if torch.isnan(param).any():
@@ -563,18 +589,23 @@ def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs
                     # 在这里设置断点进行调试
                     # 一旦参数变为NaN，训练就无法继续了
 
+            # 累计损失
             train_loss += loss.item()
         
+        # 打印训练阶段结果，输出平均训练损失。
         avg_train_loss = train_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs}")
         print(f"Train Loss: {avg_train_loss:.4f}")
 
         # --- 评估阶段 ---
+        # 切换到评估模式（禁用 dropout 等），初始化评估统计。
         model.eval()
         test_loss = 0.0
         all_preds = []
         all_labels = []
+        # 关闭梯度计算，加速推理、减少显存占用。
         with torch.no_grad():
+            # 遍历测试集
             for batch_idx, batch in enumerate(tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]")):
             # for batch in tqdm(test_loader, desc=f"Epoch {epoch+1}/{epochs} [Test]"):
                 # --- 修改：解包数据 ---
@@ -615,15 +646,18 @@ def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs
                     raise # 重新抛出异常以中断程序  
 
 
+                # 计算测试损失。与训练阶段相同，用 InfoNCE loss 评估匹配质量。
                 batch_size = sim_matrix.size(0)
                 targets = torch.arange(batch_size, device=DEVICE)
                 loss = criterion(sim_matrix, targets)
                 test_loss += loss.item()
 
+                # 收集预测与真实标签
                 predictions = torch.diag(sim_matrix).cpu().numpy()
                 all_preds.extend(predictions)
                 all_labels.extend(labels.cpu().numpy())
 
+        # 计算平均测试损失
         avg_test_loss = test_loss / len(test_loader)
         all_preds_np = np.array(all_preds)
         all_labels_np = np.array(all_labels)
@@ -637,8 +671,10 @@ def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs
             # 为了不让程序中断，可以将NaN替换为0或其他值，但这只是为了调试
             all_preds_np = np.nan_to_num(all_preds_np, nan=0.0)
 
+        # 计算整体 AUC。AUC 衡量模型区分正负样本的能力；越接近 1 越好。
         test_auc = roc_auc_score(all_labels_np, all_preds_np)
 
+        # 按用户计算 Recall@K 和 Precision@K
         eval_df = pd.DataFrame({'user': test_user_ids, 'pred_score': all_preds_np, 'label': all_labels_np})
         user_metrics = []
         for user_id, group_df in eval_df.groupby('user'):
@@ -652,9 +688,11 @@ def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs
             precision_at_k = num_correct_in_top_k / K if K > 0 else 0.0
             user_metrics.append({'recall@k': recall_at_k, 'precision@k': precision_at_k})
         
+        # 计算平均指标
         avg_recall_at_k = pd.DataFrame(user_metrics)['recall@k'].mean() if user_metrics else 0.0
         avg_precision_at_k = pd.DataFrame(user_metrics)['precision@k'].mean() if user_metrics else 0.0
 
+        # 打印评估结果
         print(f"Test Loss: {avg_test_loss:.4f} | Test AUC: {test_auc:.4f}")
         print(f"Test Recall@{K}: {avg_recall_at_k:.4f} | Test Precision@{K}: {avg_precision_at_k:.4f}")
         print("-" * 80)
