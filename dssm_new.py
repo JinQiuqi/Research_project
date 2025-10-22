@@ -703,52 +703,54 @@ def train_model_infonce(model, train_loader, test_loader, test_df, K=100, epochs
 
 # --- 5. 主程序：数据加载、模型初始化与训练 ---
 # --- 5. 主程序：数据加载、模型初始化与训练 ---
-if __name__ == "__main__":
+if __name__ == "__main__": # 仅当作为脚本直接运行时执行（被import时不执行）
     # --- 配置 ---
     DATA_PATH_PART1 = "/workspace/data1/program/train_csv.csv"
     DATA_PATH_MAY13 = "/workspace/data1/program/may13_data.csv"
-    BATCH_SIZE = 64
-    EPOCHS = 10
+    BATCH_SIZE = 64 # 训练/测试批大小
+    EPOCHS = 10 # 训练轮数
     LR = 5e-7 # 保持较小的学习率
 
     # --- Transformer 和 GRU 超参数 ---
-    MAX_SEQ_LEN = 20
-    USER_SEQ_EMBEDDING_DIM = 32
-    NHEAD = 2
-    NUM_LAYERS = 2
-    ITEM_GRU_HIDDEN_DIM = 64
+    MAX_SEQ_LEN = 20 # 用户行为序列的最大长度（padding/截断）
+    USER_SEQ_EMBEDDING_DIM = 32 # 用户序列中item嵌入维度 d_model
+    NHEAD = 2 # Transformer 多头注意力的头数
+    NUM_LAYERS = 2 # 计划使用的Transformer层数（下方实例化里实际用了1层）
+    ITEM_GRU_HIDDEN_DIM = 64 # 物品塔GRU隐藏层维度（门控融合输出维度）
 
     # --- 加载和预处理数据 ---
     print("Loading and preprocessing data...")
     # 读取数据，可以考虑限制行数以加快调试
-    data_part1 = pd.read_csv(DATA_PATH_PART1)
-    data_part1['time_stamp'] = pd.to_datetime(data_part1['time_stamp'])
+    data_part1 = pd.read_csv(DATA_PATH_PART1) # 读入第一部分数据
+    data_part1['time_stamp'] = pd.to_datetime(data_part1['time_stamp']) # 将时间列转为时间类型
+    # 过滤掉 2017-05-13 当天的数据（准备与另一份当天数据合并）
     data_part1 = data_part1[data_part1['time_stamp'].dt.date != pd.to_datetime('2017-05-13').date()]
 
-    data_may13 = pd.read_csv(DATA_PATH_MAY13)
+    data_may13 = pd.read_csv(DATA_PATH_MAY13) # 读入 5/13 当天的数据
     
-    con = pd.concat([data_part1, data_may13], ignore_index=True).copy()
-    del data_part1, data_may13
+    con = pd.concat([data_part1, data_may13], ignore_index=True).copy()  # 合并两份数据，重新索引
+    del data_part1, data_may13 # 释放内存
 
-    # 确保所有需要的列都存在
+    # 确保所有需要的列都存在（按模型/数据集需求列出必需字段）
     required_cols = ["user", "item_seq", "brand", "ad_ctr", "price", "brand_total_impressions",
                      "user_avg_ctr", "brand_ctr", "ad_total_clicks", "cate_id", "adgroup_id",
                      "customer", "age_price", "ad_total_impressions", 'gender_cate',
                      'user_total_interactions', 'cate_total_clicks', 'cms_group_id',
                      'cate_ctr', 'cate_total_impressions', "clk"]
-    # 过滤出存在的列
+    # 过滤出存在的列（防止上面列名有的在数据里缺失而报错）
     existing_cols = [col for col in required_cols if col in con.columns]
-    con = con[existing_cols]
+    con = con[existing_cols] # 只保留存在的列，丢弃其余
+
 
     # --- 核心修改：处理 item_seq 字段 ---
-    con['item_seq'] = con['item_seq'].apply(parse_item_seq)
+    con['item_seq'] = con['item_seq'].apply(parse_item_seq) # 将字符串形式的序列解析为list[int]
 
     # --- 在此处插入您提供的代码片段 ---
     # 核心修改：处理item_seq并过滤有效token<2的样本
-    initial_count = len(con)
+    initial_count = len(con) # 过滤前样本数
     # 保留至少2个有效token的样本（避免注意力计算极端化）
     con = con[con['item_seq'].apply(lambda seq: len(seq) >= 2)]
-    filtered_count = initial_count - len(con)
+    filtered_count = initial_count - len(con) # 过滤掉的样本数
     print(f"Filtered {filtered_count} samples (empty or <2 valid tokens), remaining: {len(con)}")
 
     # 若剩余样本过少，终止程序（避免无意义训练）
@@ -756,45 +758,46 @@ if __name__ == "__main__":
         raise ValueError(f"Remaining samples ({len(con)}) too few! Check raw data quality.")
     # --- 代码片段结束 ---
 
-    # 为行为序列中的物品ID创建映射
+    # 为行为序列中的物品ID创建映射（原始ID → 连续索引，用于Embedding）
     all_item_ids = set()
-    for seq in con['item_seq']:
+    for seq in con['item_seq']: # 遍历所有序列，收集出现过的item_id
         all_item_ids.update(seq)
-    if 'adgroup_id' in con.columns:
+    if 'adgroup_id' in con.columns: # 还把广告组ID也并入“物品词表”，便于共享Embedding
         all_item_ids.update(con['adgroup_id'].unique())
-    item_id_mapping = {id: idx+1 for idx, id in enumerate(all_item_ids)} # PAD=0
-    NUM_ITEM_IDS = len(item_id_mapping) + 1
+    item_id_mapping = {id: idx+1 for idx, id in enumerate(all_item_ids)} # PAD=0 # 0留给PAD（padding_idx=0）
+    NUM_ITEM_IDS = len(item_id_mapping) + 1 # 词表大小 = 映射数 + PAD
+    # 将序列里的原始ID替换为映射后的索引（若个别ID不在映射中则跳过）
     con['item_seq'] = con['item_seq'].apply(lambda seq: [item_id_mapping[id] for id in seq if id in item_id_mapping])
 
-    # 映射其他离散变量
+    # 映射其他离散变量（用于 nn.Embedding）
     columns_to_map = ['brand', 'cate_id', 'adgroup_id', "customer", "age_price", 'gender_cate', 'cms_group_id']
     columns_to_map = [col for col in columns_to_map if col in con.columns]
     for col in columns_to_map:
-        con[col] = con[col].astype('category').cat.codes
-        con[col] = con[col] + 1 # 确保没有-1
+        con[col] = con[col].astype('category').cat.codes # pandas类别编码（-1可能表示缺失）
+        con[col] = con[col] + 1 # 确保没有-1 # 统一从1开始，预留0给“未出现/填充”
 
-    # 类型转换
+    # 类型转换（保证dtype正确）
     for col in ['brand', 'clk']:
         if col in con.columns:
             con[col] = con[col].astype("int")
 
     # 划分数据集
     # 这里划分具体按照自己的数据集进行划分 ，而不是50000
-    train_df = con.iloc[:50000].sample(n=5000, random_state=42)
-    test_df = con.iloc[50000:].sample(n=5000, random_state=42)
+    train_df = con.iloc[:50000].sample(n=5000, random_state=42) # 先取前5万行，再随机采样5000作训练
+    test_df = con.iloc[50000:].sample(n=5000, random_state=42) # 从之后的行中采样5000作测试（时序/去泄漏）
     
-    X_train = train_df.drop(["clk"], axis=1, errors='ignore')
-    y_train = train_df["clk"]
-    X_test = test_df.drop(["clk"], axis=1, errors='ignore')
-    y_test = test_df["clk"]
+    X_train = train_df.drop(["clk"], axis=1, errors='ignore') # 训练特征
+    y_train = train_df["clk"] # 训练标签（点击0/1）
+    X_test = test_df.drop(["clk"], axis=1, errors='ignore') # 测试特征
+    y_test = test_df["clk"] # 测试标签
 
-    # 创建数据加载器
-    train_dataset = AdDataset(X_train, y_train, max_seq_len=MAX_SEQ_LEN)
+    # 创建数据加载器（封装成Dataset → DataLoader，用于批次训练）
+    train_dataset = AdDataset(X_train, y_train, max_seq_len=MAX_SEQ_LEN) # 自定义Dataset会做padding/标准化等
     test_dataset = AdDataset(X_test, y_test, max_seq_len=MAX_SEQ_LEN)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True) # 打乱训练数据
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE) # 测试集不打乱
 
-    # 准备特征计数
+    # 准备特征计数（类别Embedding层需要num_embeddings）
     feature_counts = {}
     for col in ['age_price', 'gender_cate', 'cms_group_id', 'brand', 'cate_id', 'adgroup_id', 'customer']:
         if col in con.columns:
@@ -803,15 +806,15 @@ if __name__ == "__main__":
     # --- 初始化和训练模型 ---
     print("Initializing model...")
     model = DualTower(
-        # --- 新增参数 ---
-        num_item_ids=NUM_ITEM_IDS,
-        max_seq_len=MAX_SEQ_LEN,
-        user_seq_embedding_dim=USER_SEQ_EMBEDDING_DIM,
-        nhead=NHEAD,
-        num_layers=NUM_LAYERS,
-        item_gru_hidden_dim=ITEM_GRU_HIDDEN_DIM,
+        # --- 新增参数：序列/Transformer/GRU相关 ---
+        num_item_ids=NUM_ITEM_IDS,  # item序列词表大小（含PAD）
+        max_seq_len=MAX_SEQ_LEN, # 最大序列长度（供模型内部mask/对齐）
+        user_seq_embedding_dim=USER_SEQ_EMBEDDING_DIM, # 序列嵌入维度 d_model
+        nhead=NHEAD, # 多头注意力头数
+        num_layers=NUM_LAYERS, # 计划层数（当前构造里用1层）
+        item_gru_hidden_dim=ITEM_GRU_HIDDEN_DIM, # 物品塔GRU隐藏维度
         
-        # --- 原有参数 ---
+        # --- 原有参数：各类别特征的num_embeddings ---
         num_age_price=feature_counts.get("num_age_price", 1),
         num_gender_cate=feature_counts.get("num_gender_cate", 1),
         num_cms_group_id=feature_counts.get("num_cms_group_id", 1),
@@ -819,23 +822,23 @@ if __name__ == "__main__":
         num_cate_id=feature_counts.get("num_cate_id", 1),
         num_adgroup_id=feature_counts.get("num_adgroup_id", 1),
         num_customer=feature_counts.get("num_customer", 1),
-        embedding_dim=64,
-        hidden_dim=32,
-        final_dim=16,
+        embedding_dim=64, # 连续/类别映射到统一64维
+        hidden_dim=32, # MLP隐藏维
+        final_dim=16,  # 两塔最终embedding维度
     )
 
     print("Starting training...")
-    trained_model = train_model_infonce(
+    trained_model = train_model_infonce( # 启动训练+评估循环（InfoNCE版本）
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
         test_df=test_df,
-        K=100,
+        K=100, # 计算Recall@100 / Precision@100
         epochs=EPOCHS,
         lr=LR,
-        temperature=0.07,
+        temperature=0.07, # InfoNCE温度参数
     )
     
     # 可选：保存模型
     # torch.save(trained_model.state_dict(), f'dual_tower_transformer_gru_epochs_{EPOCHS}.pth')
-    print("Training finished.")
+    print("Training finished.") # 训练结束
